@@ -1,0 +1,10 @@
+/target
+.env
+.env.*
+!.env.example
+/config.json
+/config.*.json
+!/config.example.json
+*.log
+/output*.html
+/output*.translations.json

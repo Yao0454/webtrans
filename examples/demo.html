@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Welcome to Webtrans</title>
+        <style>
+            body {
+                font-family: system-ui, sans-serif;
+                max-width: 48rem;
+                margin: 3rem auto;
+            }
+            strong {
+                color: #165ea5;
+            }
+            .status {
+                border: 1px solid #ddd;
+                padding: 1rem;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Translate a page without changing its code</h1>
+        <p>
+            Hello <strong>world</strong>! Keep <em>formatting</em> while
+            translating.
+        </p>
+        <p>Welcome back, {{name}}.</p>
+        <label for="email">Your email address</label>
+        <input
+            id="email"
+            type="email"
+            placeholder="Enter your email"
+            aria-label="Email address"
+        />
+        <button type="button" title="Show a message" id="show-message">
+            Continue
+        </button>
+        <p class="status">Ready</p>
+        <p>Ready</p>
+        <p translate="no">Webtrans — do not translate this line.</p>
+        <pre><code>const greeting = "Hello, world!";</code></pre>
+        <script>
+            // Runtime-generated text is deliberately outside this static translator's scope.
+            document
+                .querySelector("#show-message")
+                .addEventListener("click", () => {
+                    document.querySelector(".status").textContent =
+                        "Message from JavaScript";
+                });
+        </script>
+    </body>
+</html>
