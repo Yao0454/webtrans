@@ -17,6 +17,25 @@ const HTML: &str = r#"<!doctype html>
 <button title="Open menu">Open</button></body></html>
 "#;
 
+// Captured from the original v1 executable before rebuilding the v2 sources.
+// Keep this literal rather than regenerating it with the current extraction rules.
+const LEGACY_HTML: &str = r#"<p>Click <a href="/one" title="Open">here</a> or <a href="/two" title="Open">there</a>.</p><textarea placeholder="Your message" aria-label="Message">Keep this default</textarea>"#;
+const LEGACY_TABLE: &str = r#"{
+  "version": 1,
+  "source_sha256": "af26443c9540a5a41dc174a066e5b2eb5f297f1a8567ce6bc1f44800d7381b1d",
+  "source_language": null,
+  "target_language": null,
+  "entries": {
+    "u000001": { "kind": "text", "source": "Click", "translation": null, "context": "p", "start": 3, "end": 8, "placeholders": {} },
+    "u000002": { "kind": "attribute", "source": "Open", "translation": null, "context": "p > a@title", "start": 31, "end": 35, "placeholders": {} },
+    "u000003": { "kind": "text", "source": "here", "translation": null, "context": "p > a", "start": 37, "end": 41, "placeholders": {} },
+    "u000004": { "kind": "text", "source": "or", "translation": null, "context": "p", "start": 46, "end": 48, "placeholders": {} },
+    "u000005": { "kind": "attribute", "source": "Open", "translation": null, "context": "p > a@title", "start": 71, "end": 75, "placeholders": {} },
+    "u000006": { "kind": "text", "source": "there", "translation": null, "context": "p > a", "start": 77, "end": 82, "placeholders": {} }
+  }
+}"#;
+const LEGACY_TRANSLATED_HTML: &str = r#"<p>点击 <a href="/one" title="打开一">这里</a> 或 <a href="/two" title="打开二">那里</a>.</p><textarea placeholder="Your message" aria-label="Message">Keep this default</textarea>"#;
+
 fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_webtrans"))
         .args(args)
@@ -130,7 +149,7 @@ fn terminal_logs_show_real_table_schema_and_verbose_expands_the_preview() {
 fn extract_and_apply_preserve_code_and_distinguish_repeated_text() {
     let dir = fixture(HTML);
     let mut table = table(dir.path());
-    assert_eq!(table["version"], 1);
+    assert_eq!(table["version"], 2);
     assert_eq!(table["source_sha256"].as_str().unwrap().len(), 64);
     let entries = table["entries"].as_object_mut().unwrap();
     let hello_ids: Vec<String> = entries
@@ -215,6 +234,184 @@ fn inline_markup_survives_translation() {
     assert_eq!(
         fs::read_to_string(dir.path().join("output.html")).unwrap(),
         "<p>你好 <strong class='x'>世界</strong>!</p>"
+    );
+}
+
+#[test]
+fn v2_keeps_whole_sentence_and_translates_identical_inline_tags_independently() {
+    let html = r#"<p>Click <a href="/same" title="Open">here</a> or <a href="/same" title="Open">there</a>.</p>"#;
+    let dir = fixture(html);
+    let mut table = table(dir.path());
+    assert_eq!(table["version"], 2);
+    let entries = table["entries"].as_object_mut().unwrap();
+    assert_eq!(entries.len(), 3, "one complete sentence and two titles");
+    let mut title_number = 0;
+    for entry in entries.values_mut() {
+        if entry["kind"] == "text" {
+            let source = entry["source"].as_str().unwrap();
+            let markers = entry["placeholders"].as_object().unwrap();
+            assert_eq!(markers.len(), 4);
+            let plain = markers
+                .keys()
+                .fold(source.to_owned(), |text, marker| text.replace(marker, ""));
+            assert_eq!(plain, "Click here or there.");
+            entry["translation"] = Value::String(
+                source
+                    .replace("Click", "点击")
+                    .replace("there", "那里")
+                    .replace("here", "这里")
+                    .replace(" or ", " 或 "),
+            );
+        } else {
+            assert_eq!(entry["kind"], "attribute");
+            assert_eq!(entry["source"], "Open");
+            title_number += 1;
+            entry["translation"] = Value::String(format!("打开{title_number}"));
+        }
+    }
+    assert_eq!(title_number, 2);
+    save_table(dir.path(), &table);
+    success(&run(
+        dir.path(),
+        &["apply", "input.html", "table.json", "-o", "output.html"],
+    ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("output.html")).unwrap(),
+        r#"<p>点击 <a href="/same" title="打开1">这里</a> 或 <a href="/same" title="打开2">那里</a>.</p>"#
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("input.html")).unwrap(),
+        html
+    );
+}
+
+#[test]
+fn v2_inline_attributes_apply_when_sentence_translation_is_unchanged_or_missing() {
+    let html = r#"<p>Visit <a title="Open" href="/same">here</a> and <a title="Open" href="/same">there</a>.</p>"#;
+    for missing_sentence in [false, true] {
+        let dir = fixture(html);
+        let mut table = table(dir.path());
+        let mut number = 0;
+        for entry in table["entries"].as_object_mut().unwrap().values_mut() {
+            if entry["kind"] == "text" {
+                if !missing_sentence {
+                    entry["translation"] = entry["source"].clone();
+                }
+            } else {
+                number += 1;
+                entry["translation"] = Value::String(format!("打开{number}"));
+            }
+        }
+        assert_eq!(number, 2);
+        save_table(dir.path(), &table);
+        let mut args = vec!["apply", "input.html", "table.json", "-o", "output.html"];
+        if missing_sentence {
+            args.push("--allow-missing");
+        }
+        success(&run(dir.path(), &args));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("output.html")).unwrap(),
+            r#"<p>Visit <a title="打开1" href="/same">here</a> and <a title="打开2" href="/same">there</a>.</p>"#
+        );
+    }
+}
+
+#[test]
+fn v2_translates_textarea_attributes_and_preserves_default_value() {
+    let html = r#"<textarea placeholder="Your message" aria-label='Message' title=Help><b>Keep this default</b> &amp; text</textarea>"#;
+    let dir = fixture(html);
+    let mut table = table(dir.path());
+    let entries = table["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(entries.values().all(|entry| entry["kind"] == "attribute"));
+    translate_all(&mut table, |source| match source {
+        "Your message" => "请输入留言".into(),
+        "Message" => "留言".into(),
+        "Help" => "填写 帮助".into(),
+        other => panic!("unexpected textarea attribute source: {other}"),
+    });
+    save_table(dir.path(), &table);
+    success(&run(
+        dir.path(),
+        &["apply", "input.html", "table.json", "-o", "output.html"],
+    ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("output.html")).unwrap(),
+        r#"<textarea placeholder="请输入留言" aria-label='留言' title="填写 帮助"><b>Keep this default</b> &amp; text</textarea>"#
+    );
+}
+
+fn legacy_fixture() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("input.html"), LEGACY_HTML).unwrap();
+    let mut table: Value = serde_json::from_str(LEGACY_TABLE).unwrap();
+    for (id, translation) in [
+        ("u000001", "点击"),
+        ("u000002", "打开一"),
+        ("u000003", "这里"),
+        ("u000004", "或"),
+        ("u000005", "打开二"),
+        ("u000006", "那里"),
+    ] {
+        table["entries"][id]["translation"] = Value::String(translation.into());
+    }
+    table["target_language"] = Value::String("zh-CN".into());
+    save_table(dir.path(), &table);
+    dir
+}
+
+#[test]
+fn legacy_v1_table_applies_using_original_extraction_rules() {
+    let dir = legacy_fixture();
+    success(&run(
+        dir.path(),
+        &["apply", "input.html", "table.json", "-o", "output.html"],
+    ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("output.html")).unwrap(),
+        LEGACY_TRANSLATED_HTML
+    );
+    assert_eq!(table(dir.path())["version"], 1);
+}
+
+#[test]
+fn run_resumes_completed_v1_checkpoint_without_new_requests_or_migration() {
+    let dir = legacy_fixture();
+    let original_table = table(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = json!({
+        "base_url": format!("http://{}/v1", listener.local_addr().unwrap()),
+        "api_key": "unused-local-test-key",
+        "model": "mock"
+    });
+    fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    success(&run(
+        dir.path(),
+        &[
+            "run",
+            "input.html",
+            "-o",
+            "output.html",
+            "--table",
+            "table.json",
+            "--to",
+            "zh-CN",
+            "--resume",
+            "--retries",
+            "0",
+            "--timeout",
+            "1",
+        ],
+    ));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "a fully translated checkpoint must not issue another API request"
+    );
+    assert_eq!(table(dir.path()), original_table);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("output.html")).unwrap(),
+        LEGACY_TRANSLATED_HTML
     );
 }
 

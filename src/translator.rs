@@ -44,7 +44,10 @@ pub fn translate_table(
     mut on_batch: impl FnMut(&TranslationTable, usize, usize) -> Result<()>,
 ) -> Result<()> {
     let endpoint = validate_config(config)?;
-    ensure!(table.version == 1, "Unsupported translation table version");
+    ensure!(
+        matches!(table.version, 1 | 2),
+        "Unsupported translation table version"
+    );
 
     let has_translations = table
         .entries
@@ -789,10 +792,15 @@ mod tests {
             entry.translation = Some(entry.source.clone());
         }
         table.target_language = Some("zh-CN".to_owned());
-        translate_table(&mut table, &config, |_, _, _| {
-            panic!("A completed table must not create a new batch")
-        })
-        .unwrap();
+        for version in [1, 2] {
+            table.version = version;
+            translate_table(&mut table, &config, |_, _, _| {
+                panic!("A completed table must not create a new batch")
+            })
+            .unwrap();
+        }
+        table.version = 3;
+        assert!(translate_table(&mut table, &config, |_, _, _| Ok(())).is_err());
     }
 
     #[test]

@@ -228,10 +228,13 @@ fn execute(cli: Cli) -> Result<()> {
             let settings = load_api_settings(&api)?;
             protect_config(&settings, &[&output, &table_path])?;
             let source = read_html(&input)?;
-            let mut extracted = html::extract(&source)?;
-            extracted.source_language = nonempty_language(api.from.clone())?;
-            log_table("extract / 提取完成", &extracted, None, verbose)?;
-            let mut translations = prepare_table(extracted, &table_path, &recovery)?;
+            let mut translations = prepare_run_table(
+                &source,
+                &table_path,
+                &recovery,
+                nonempty_language(api.from.clone())?,
+                verbose,
+            )?;
             translate_and_save(
                 &mut translations,
                 &table_path,
@@ -291,12 +294,14 @@ fn translate_and_save(
         .map(|(id, _)| id.clone())
         .collect();
     let mut has_checkpoint = recovery.resume && output.try_exists()?;
+    let mut saved_batch = false;
     let result = translate_table(
         table,
         &config,
         |current, completed_batches, total_batches| {
             write_table(output, current, recovery.force || has_checkpoint)?;
             has_checkpoint = true;
+            saved_batch = true;
             let batch_ids: BTreeSet<String> = current
                 .entries
                 .iter()
@@ -328,8 +333,11 @@ fn translate_and_save(
         }
         return Err(error);
     }
-    // Also persist empty tables or already completed input tables (no API batches).
-    write_table(output, table, recovery.force || has_checkpoint)?;
+    // The final batch already contains the complete table. Only no-batch runs
+    // need a write here, including empty tables and already completed inputs.
+    if !saved_batch {
+        write_table(output, table, recovery.force || has_checkpoint)?;
+    }
     Ok(())
 }
 
@@ -422,8 +430,43 @@ fn prepare_table(
     output: &Path,
     recovery: &RecoveryArgs,
 ) -> Result<TranslationTable> {
+    let checkpoint = read_checkpoint(output, recovery)?;
+    prepare_with_checkpoint(original, output, recovery, checkpoint)
+}
+
+fn prepare_run_table(
+    source: &str,
+    output: &Path,
+    recovery: &RecoveryArgs,
+    source_language: Option<String>,
+    verbose: bool,
+) -> Result<TranslationTable> {
+    // Existing checkpoints bind IDs and ranges to the extraction algorithm that
+    // created them. Re-extract with that version instead of upgrading on resume.
+    let checkpoint = read_checkpoint(output, recovery)?;
+    let mut extracted = match &checkpoint {
+        Some(table) => html::extract_version(source, table.version)?,
+        None => html::extract(source)?,
+    };
+    extracted.source_language = source_language;
+    log_table("extract / 提取完成", &extracted, None, verbose)?;
+    prepare_with_checkpoint(extracted, output, recovery, checkpoint)
+}
+
+fn read_checkpoint(output: &Path, recovery: &RecoveryArgs) -> Result<Option<TranslationTable>> {
     if recovery.resume && output.try_exists()? {
-        let resumed = read_table(output)?;
+        return read_table(output).map(Some);
+    }
+    Ok(None)
+}
+
+fn prepare_with_checkpoint(
+    original: TranslationTable,
+    output: &Path,
+    recovery: &RecoveryArgs,
+    checkpoint: Option<TranslationTable>,
+) -> Result<TranslationTable> {
+    if let Some(resumed) = checkpoint {
         ensure_same_source_table(&original, &resumed)?;
         eprintln!(
             "Resuming {}/{} completed entries from {}",
@@ -531,7 +574,7 @@ fn read_table(path: &Path) -> Result<TranslationTable> {
     let table: TranslationTable = serde_json::from_str(&json)
         .with_context(|| format!("Invalid translation table {}", path.display()))?;
     ensure!(
-        table.version == 1,
+        matches!(table.version, 1 | 2),
         "Unsupported translation table version: {}",
         table.version
     );
@@ -613,4 +656,66 @@ fn write_atomic(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
         bail!("Cannot save {}: {}", path.display(), error.error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_supported_table_versions_and_rejects_unknown_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.json");
+        for version in [1, 2] {
+            let table = html::extract_version("<p>Hello</p>", version).unwrap();
+            write_table(&path, &table, true).unwrap();
+            assert_eq!(read_table(&path).unwrap().version, version);
+        }
+        let mut table = html::extract("<p>Hello</p>").unwrap();
+        table.version = 3;
+        write_table(&path, &table, true).unwrap();
+        assert!(
+            read_table(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("version: 3")
+        );
+    }
+
+    #[test]
+    fn run_resume_preserves_checkpoint_extraction_version_and_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let source = "<p>Hello <strong>world</strong></p><p>Again</p>";
+        let recovery = RecoveryArgs {
+            resume: true,
+            force: false,
+        };
+        for version in [1, 2] {
+            let mut checkpoint = html::extract_version(source, version).unwrap();
+            checkpoint.source_language = Some("en".to_owned());
+            checkpoint.target_language = Some("zh-CN".to_owned());
+            let entry = checkpoint.entries.values_mut().next().unwrap();
+            entry.translation = Some(entry.source.clone());
+            write_table(&path, &checkpoint, true).unwrap();
+            let resumed = prepare_run_table(source, &path, &recovery, None, false).unwrap();
+            assert_eq!(resumed, checkpoint);
+        }
+    }
+
+    #[test]
+    fn run_resume_still_rejects_modified_legacy_checkpoint_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let source = "<p>Hello</p>";
+        let mut checkpoint = html::extract_version(source, 1).unwrap();
+        checkpoint.entries.values_mut().next().unwrap().start += 1;
+        write_table(&path, &checkpoint, false).unwrap();
+        let recovery = RecoveryArgs {
+            resume: true,
+            force: false,
+        };
+        let error = prepare_run_table(source, &path, &recovery, None, false).unwrap_err();
+        assert!(error.to_string().contains("altered extraction table"));
+    }
 }

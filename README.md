@@ -97,7 +97,7 @@ cargo run -- extract examples/demo.html -o /tmp/strings.json --from en
 | `start` / `end` | 原始 UTF-8 HTML 中的字节位置 |
 | `placeholders` | 占位符与原始 HTML / 变量的对应关系 |
 
-顶层还包含 `version`、`source_sha256`、`source_language` 和 `target_language`。ID 按每次出现的位置分配；HTML 改变后需要重新提取，不能把旧表直接套上去。
+顶层还包含 `version`、`source_sha256`、`source_language` 和 `target_language`。新提取的表使用版本 2。版本 1 的表仍可翻译、续译和回填，续译时沿用旧表的分段和 ID。要将已有页面改为按新版规则提取，请从原 HTML 生成新表。HTML 改变后也需要重新提取。
 
 ### 2. 翻译表
 
@@ -154,9 +154,9 @@ cargo run -- translate /tmp/strings.json \
 - 按片段回填，不重新序列化整份 DOM。没有修改的区域保留原字节，包括 JS、CSS、注释、标签写法、属性顺序等。
 - 同一文本片段内的内联标签会变成 `[[[WT_000001]]]` 形式的占位符，和整段文本一起翻译。占位符必须完整保留，顺序不能改变；这是第一版保护结构的限制。
 - 译文作为普通文本转义后再写入；受保护的原始标签和变量按映射恢复，API 生成的标签不会作为新 HTML 执行。
-- 常用文本属性会单独提取。带可翻译属性的内联标签可能将整句分为多个片段，以避免属性和正文的写入范围重叠。
+- 正文中的链接保留在整句话里，链接的 `title` 等属性作为独立条目翻译。即使两个链接的标签和属性完全相同，也可以分别填写不同的属性译文。
 - 属性范围包括 `title`、`alt`、`placeholder`、`aria-label`、`aria-description`、按钮类 `input` 的 `value` 和 `meta[name=description]` 的 `content`。
-- 跳过 `script`、`style`、`pre`、`code`、`noscript`、`template`、`textarea`、SVG / MathML、iframe 等代码或特殊内容，以及 `translate="no"`、`class="notranslate"` 子树。
+- `textarea` 的 `placeholder`、`aria-label` 等提示属性参与翻译，框内的默认文本保持原样。跳过 `script`、`style`、`pre`、`code`、`noscript`、`template`、SVG / MathML、iframe 等特殊内容和 `class="notranslate"` 子树。子元素可通过 `translate="yes"` 恢复被祖先 `translate="no"` 关闭的翻译。
 - 保护简单的 `{{name}}`、`{{{name}}}`、`${name}`、`{name}` 模板变量；不包含完整模板语言解析器。`[[[WT_` 是保留前缀，原 HTML 包含它时会明确报错。
 - 静态翻译不会运行页面 JS，也不会翻译 JS 字符串、CSS `content` 或运行后动态生成的文字。动态页面应先从应用的国际化资源入手，或另加渲染后文本提取流程。
 - 输入必须为 UTF-8。工具不更改 `<html lang>`、文字方向或排版；这些属于翻译后的页面适配。

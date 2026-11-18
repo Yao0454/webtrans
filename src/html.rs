@@ -2,6 +2,7 @@
 //! the tokenizer never serializes or executes the source document.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
 use html5gum::{DefaultEmitter, StartTag, State, Token, Tokenizer};
@@ -15,6 +16,8 @@ const MARKER_PREFIX: &str = "[[[WT_";
 struct Frame {
     name: String,
     suppressed: bool,
+    hard_suppressed: bool,
+    translate_enabled: bool,
     boundary: bool,
 }
 
@@ -29,13 +32,35 @@ struct Piece {
 struct Group {
     pieces: Vec<Piece>,
     context: String,
+    // Private, freshly parsed bindings. Never trust raw tag matching or offsets
+    // supplied by a translation file when composing nested attribute edits.
+    markup_bindings: BTreeMap<usize, BTreeMap<String, Range<usize>>>,
 }
 
 /// Extract text groups and selected human-readable attributes into a stable map.
-/// Inline elements with translatable attributes delimit groups to avoid
-/// overlapping replacements. Unsupported code/foreign/template subtrees remain
-/// completely untouched.
+/// Inline tags remain part of the surrounding sentence; their human-readable
+/// attributes are separate entries whose edits are composed during application.
 pub fn extract(html: &str) -> Result<TranslationTable> {
+    extract_version(html, 2)
+}
+
+/// Recreate the extraction rules associated with a saved translation table.
+/// Version 1 keeps its original grouping and suppression semantics so existing
+/// checkpoints can still be validated and applied without migration.
+pub fn extract_version(html: &str, version: u32) -> Result<TranslationTable> {
+    Ok(extract_with_bindings(html, version)?.table)
+}
+
+struct Extraction {
+    table: TranslationTable,
+    markup_bindings: BTreeMap<usize, BTreeMap<String, Range<usize>>>,
+}
+
+fn extract_with_bindings(html: &str, version: u32) -> Result<Extraction> {
+    ensure!(
+        matches!(version, 1 | 2),
+        "unsupported translation table version {version}"
+    );
     ensure!(
         !html.contains(MARKER_PREFIX),
         "HTML contains the reserved placeholder prefix {MARKER_PREFIX}"
@@ -53,17 +78,47 @@ pub fn extract(html: &str) -> Result<TranslationTable> {
                 if close_implicit_elements(&name, &mut stack) {
                     finish_group(html, &mut group, &mut entries)?;
                 }
-                let suppressed = stack.last().is_some_and(|f| f.suppressed)
-                    || excluded_tag(&name)
-                    || attr(&tag, "translate").is_some_and(|v| v.eq_ignore_ascii_case("no"))
-                    || attr(&tag, "class")
-                        .is_some_and(|v| v.split_ascii_whitespace().any(|v| v == "notranslate"));
-                let attrs = if suppressed {
+                let translate = attr(&tag, "translate");
+                let notranslate = attr(&tag, "class")
+                    .is_some_and(|v| v.split_ascii_whitespace().any(|v| v == "notranslate"));
+                let (suppressed, suppress_attributes, hard_suppressed, translate_enabled) =
+                    if version == 1 {
+                        let suppressed = stack.last().is_some_and(|f| f.suppressed)
+                            || excluded_tag(&name)
+                            || translate
+                                .as_ref()
+                                .is_some_and(|v| v.eq_ignore_ascii_case("no"))
+                            || notranslate;
+                        (suppressed, suppressed, suppressed, !suppressed)
+                    } else {
+                        let translate_enabled = match translate.as_deref() {
+                            Some(value) if value.eq_ignore_ascii_case("no") => false,
+                            Some(value)
+                                if value.is_empty() || value.eq_ignore_ascii_case("yes") =>
+                            {
+                                true
+                            }
+                            _ => stack.last().is_none_or(|frame| frame.translate_enabled),
+                        };
+                        let hard_attributes =
+                            stack.last().is_some_and(|frame| frame.hard_suppressed)
+                                || (excluded_tag(&name) && name != "textarea")
+                                || notranslate;
+                        let hard_suppressed = hard_attributes || name == "textarea";
+                        (
+                            hard_suppressed || !translate_enabled,
+                            hard_attributes || !translate_enabled,
+                            hard_suppressed,
+                            translate_enabled,
+                        )
+                    };
+                let attrs = if suppress_attributes {
                     Vec::new()
                 } else {
                     extract_attributes(html, &tag, &stack)?
                 };
-                let boundary = suppressed || !inline_tag(&name) || !attrs.is_empty();
+                let boundary =
+                    suppressed || !inline_tag(&name) || (version == 1 && !attrs.is_empty());
                 if boundary {
                     finish_group(html, &mut group, &mut entries)?;
                 } else {
@@ -89,6 +144,8 @@ pub fn extract(html: &str) -> Result<TranslationTable> {
                     stack.push(Frame {
                         name,
                         suppressed,
+                        hard_suppressed,
+                        translate_enabled,
                         boundary,
                     });
                 }
@@ -139,30 +196,48 @@ pub fn extract(html: &str) -> Result<TranslationTable> {
     }
     finish_group(html, &mut group, &mut entries)?;
     entries.sort_by_key(|entry| entry.start);
-    for pair in entries.windows(2) {
-        ensure!(pair[0].end <= pair[1].start, "overlapping HTML ranges");
+    let mut top_end = 0;
+    let mut parent: Option<&TranslationEntry> = None;
+    for entry in &entries {
+        if entry.start >= top_end {
+            top_end = entry.end;
+            parent = (entry.kind == EntryKind::Text).then_some(entry);
+        } else {
+            ensure!(
+                version == 2
+                    && entry.kind == EntryKind::Attribute
+                    && parent.is_some_and(|text| entry.end <= text.end
+                        && group
+                            .markup_bindings
+                            .get(&text.start)
+                            .is_some_and(|bindings| bindings
+                                .values()
+                                .any(|span| span.start <= entry.start && entry.end <= span.end))),
+                "overlapping HTML ranges outside a protected inline tag"
+            );
+        }
     }
-    Ok(TranslationTable {
-        version: 1,
-        source_sha256: format!("{:x}", Sha256::digest(html.as_bytes())),
-        source_language: None,
-        target_language: None,
-        entries: entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| (format!("u{:06}", i + 1), entry))
-            .collect(),
+    Ok(Extraction {
+        table: TranslationTable {
+            version,
+            source_sha256: format!("{:x}", Sha256::digest(html.as_bytes())),
+            source_language: None,
+            target_language: None,
+            entries: entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| (format!("u{:06}", i + 1), entry))
+                .collect(),
+        },
+        markup_bindings: group.markup_bindings,
     })
 }
 
 /// Validate the source binding and metadata, then replace only translated
 /// ranges. A table cannot introduce markup by modifying its stored placeholders.
 pub fn apply(html: &str, table: &TranslationTable, allow_missing: bool) -> Result<String> {
-    let expected = extract(html)?;
-    ensure!(
-        table.version == expected.version,
-        "unsupported translation table version"
-    );
+    let extraction = extract_with_bindings(html, table.version)?;
+    let expected = &extraction.table;
     ensure!(
         table.source_sha256 == expected.source_sha256,
         "source HTML changed: extract a new translation table"
@@ -171,7 +246,8 @@ pub fn apply(html: &str, table: &TranslationTable, allow_missing: bool) -> Resul
         table.entries.len() == expected.entries.len(),
         "translation table entries do not match source HTML"
     );
-    let mut patches = Vec::new();
+    let mut attribute_patches = Vec::new();
+    let mut text_translations = Vec::new();
     for (id, original) in &expected.entries {
         let entry = table
             .entries
@@ -186,18 +262,26 @@ pub fn apply(html: &str, table: &TranslationTable, allow_missing: bool) -> Resul
         match &entry.translation {
             Some(translation) => {
                 validate_translation(entry, translation).with_context(|| format!("entry {id}"))?;
-                // Identity translations are a byte-for-byte no-op, including entities.
+                // Identity text stays byte-for-byte intact, but attribute edits
+                // inside it can still be applied independently below.
                 if translation != &entry.source {
-                    let quoted = entry.kind == EntryKind::Attribute
-                        && entry.start > 0
-                        && matches!(html.as_bytes()[entry.start - 1], b'\'' | b'"');
-                    let mut replacement = render(entry, translation);
-                    if entry.kind == EntryKind::Attribute && !quoted {
-                        // Even malformed unquoted source may contain a raw quote
-                        // in a protected variable. Do not turn it into markup.
-                        replacement = format!("\"{}\"", replacement.replace('"', "&quot;"));
+                    if entry.kind == EntryKind::Attribute {
+                        let quoted = entry.start > 0
+                            && matches!(html.as_bytes()[entry.start - 1], b'\'' | b'"');
+                        let mut replacement = render(original, translation);
+                        if !quoted {
+                            // Malformed unquoted source may contain a raw quote
+                            // in a protected variable. Never promote it to markup.
+                            replacement = format!("\"{}\"", replacement.replace('"', "&quot;"));
+                        }
+                        attribute_patches.push(Patch {
+                            start: entry.start,
+                            end: entry.end,
+                            replacement,
+                        });
+                    } else {
+                        text_translations.push((original, translation));
                     }
-                    patches.push((entry.start, entry.end, replacement));
                 }
             }
             None => ensure!(
@@ -206,9 +290,84 @@ pub fn apply(html: &str, table: &TranslationTable, allow_missing: bool) -> Resul
             ),
         }
     }
-    let mut result = html.to_owned();
-    for (start, end, replacement) in patches.into_iter().rev() {
-        result.replace_range(start..end, &replacement);
+    // Entry IDs are display keys, not an ordering contract: beyond six digits
+    // their lexical order no longer follows source order. Source ranges are the
+    // authority for both composition and efficient lookup.
+    attribute_patches.sort_by_key(|patch| patch.start);
+    let mut patches = Vec::new();
+    let mut absorbed_attributes = BTreeSet::new();
+    for (entry, translation) in text_translations {
+        let mut render_entry = entry.clone();
+        let bindings = extraction.markup_bindings.get(&entry.start);
+        let mut marker_patches: BTreeMap<&str, Vec<Patch>> = BTreeMap::new();
+        let first_attribute = attribute_patches.partition_point(|patch| patch.start < entry.start);
+        let last_attribute = attribute_patches.partition_point(|patch| patch.start < entry.end);
+        for (relative_index, attribute) in attribute_patches[first_attribute..last_attribute]
+            .iter()
+            .enumerate()
+        {
+            ensure!(
+                attribute.end <= entry.end,
+                "attribute crosses a text replacement boundary"
+            );
+            let (marker, span) = bindings
+                .and_then(|bindings| {
+                    bindings.iter().find(|(_, span)| {
+                        span.start <= attribute.start && attribute.end <= span.end
+                    })
+                })
+                .context("nested attribute has no original inline marker binding")?;
+            marker_patches.entry(marker).or_default().push(Patch {
+                start: attribute.start - span.start,
+                end: attribute.end - span.start,
+                replacement: attribute.replacement.clone(),
+            });
+            absorbed_attributes.insert(first_attribute + relative_index);
+        }
+        for (marker, edits) in marker_patches {
+            let raw = render_entry
+                .placeholders
+                .get_mut(marker)
+                .context("missing inline marker")?;
+            *raw = apply_patches(raw, edits)?;
+        }
+        patches.push(Patch {
+            start: entry.start,
+            end: entry.end,
+            replacement: render(&render_entry, translation),
+        });
+    }
+    patches.extend(
+        attribute_patches
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, patch)| (!absorbed_attributes.contains(&index)).then_some(patch)),
+    );
+    apply_patches(html, patches)
+}
+
+#[derive(Debug)]
+struct Patch {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn apply_patches(source: &str, mut patches: Vec<Patch>) -> Result<String> {
+    patches.sort_by_key(|patch| patch.start);
+    for pair in patches.windows(2) {
+        ensure!(
+            pair[0].end <= pair[1].start,
+            "overlapping replacement ranges"
+        );
+    }
+    let mut result = source.to_owned();
+    for patch in patches.into_iter().rev() {
+        ensure!(
+            source.get(patch.start..patch.end).is_some(),
+            "invalid replacement range"
+        );
+        result.replace_range(patch.start..patch.end, &patch.replacement);
     }
     Ok(result)
 }
@@ -298,11 +457,14 @@ fn finish_group(html: &str, group: &mut Group, entries: &mut Vec<TranslationEntr
     let end = pieces.last().unwrap().end;
     let mut source = String::new();
     let mut placeholders = BTreeMap::new();
+    let mut markup_bindings = BTreeMap::new();
     let mut meaningful = false;
     for piece in pieces {
         let raw = &html[piece.start..piece.end];
         if piece.markup {
-            source.push_str(&add_placeholder(&mut placeholders, raw));
+            let marker = add_placeholder(&mut placeholders, raw);
+            markup_bindings.insert(marker.clone(), piece.start..piece.end);
+            source.push_str(&marker);
         } else {
             let (text, has_words) = protected_text(raw, false, &mut placeholders)?;
             source.push_str(&text);
@@ -310,6 +472,7 @@ fn finish_group(html: &str, group: &mut Group, entries: &mut Vec<TranslationEntr
         }
     }
     if meaningful {
+        group.markup_bindings.insert(start, markup_bindings);
         entries.push(TranslationEntry {
             kind: EntryKind::Text,
             source,
@@ -770,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn attributes_and_inline_attributes_do_not_overlap() {
+    fn attributes_and_inline_attributes_are_composed_safely() {
         let html = "<p>Hello <a href='/hello' title='Link &amp; help'>world</a>.</p><input placeholder=Search aria-label=Query><img alt=Photo src=a.png>";
         let mut table = extract(html).unwrap();
         fill_identity(&mut table);
@@ -927,5 +1090,165 @@ mod tests {
             apply(html, &table, false).unwrap(),
             r#"<input placeholder="你好${&quot;name&quot;}">"#
         );
+    }
+
+    #[test]
+    fn repeated_inline_tags_keep_sentence_and_independent_attributes() {
+        let html = "<p>Click <a title=Open>here</a> or <a title=Open>there</a>.</p>";
+        let mut table = extract(html).unwrap();
+        assert_eq!(table.version, 2);
+        assert_eq!(table.entries.len(), 3);
+        assert_eq!(
+            table.entries["u000001"].source,
+            "Click [[[WT_000001]]]here[[[WT_000002]]] or [[[WT_000003]]]there[[[WT_000004]]]."
+        );
+        table.entries.get_mut("u000001").unwrap().translation = Some(
+            "点击[[[WT_000001]]]这里[[[WT_000002]]]或[[[WT_000003]]]那里[[[WT_000004]]]。"
+                .to_owned(),
+        );
+        table.entries.get_mut("u000002").unwrap().translation = Some("打开此处".to_owned());
+        table.entries.get_mut("u000003").unwrap().translation = Some("打开彼处".to_owned());
+        assert_eq!(
+            apply(html, &table, false).unwrap(),
+            "<p>点击<a title=\"打开此处\">这里</a>或<a title=\"打开彼处\">那里</a>。</p>"
+        );
+        // Trusted source bindings, rather than matching identical raw tags,
+        // determine which attribute is rewritten.
+        table.entries.get_mut("u000002").unwrap().translation = None;
+        assert_eq!(
+            apply(html, &table, true).unwrap(),
+            "<p>点击<a title=Open>这里</a>或<a title=\"打开彼处\">那里</a>。</p>"
+        );
+    }
+
+    #[test]
+    fn nested_attributes_apply_with_identity_or_missing_text() {
+        let html = "<p>Fish &amp; <a title='Open &amp; help'>chips</a>.</p>";
+        let mut table = extract(html).unwrap();
+        fill_identity(&mut table);
+        assert_eq!(apply(html, &table, false).unwrap(), html);
+        table.entries.get_mut("u000002").unwrap().translation = Some("打开帮助".to_owned());
+        let expected = "<p>Fish &amp; <a title='打开帮助'>chips</a>.</p>";
+        assert_eq!(apply(html, &table, false).unwrap(), expected);
+        table.entries.get_mut("u000001").unwrap().translation = None;
+        assert_eq!(apply(html, &table, true).unwrap(), expected);
+        assert!(apply(html, &table, false).is_err());
+        // Nested metadata is authenticated even when that entry is untranslated.
+        table.entries.get_mut("u000002").unwrap().end += 1;
+        assert!(apply(html, &table, true).is_err());
+    }
+
+    #[test]
+    fn nested_inline_attributes_and_template_variables_keep_bindings() {
+        let html = "<p>Hello {{name}}, <a title='Visit {site}' aria-label='Open page'><strong title=Bold>world</strong></a>!</p>";
+        let mut table = extract(html).unwrap();
+        assert_eq!(table.entries.len(), 4);
+        let text = table.entries.get_mut("u000001").unwrap();
+        assert_eq!(
+            text.source,
+            "Hello [[[WT_000001]]], [[[WT_000002]]][[[WT_000003]]]world[[[WT_000004]]][[[WT_000005]]]!"
+        );
+        text.translation = Some("你好 [[[WT_000001]]]，[[[WT_000002]]][[[WT_000003]]]世界[[[WT_000004]]][[[WT_000005]]]！".to_owned());
+        table.entries.get_mut("u000002").unwrap().translation =
+            Some("访问 [[[WT_000001]]]".to_owned());
+        table.entries.get_mut("u000003").unwrap().translation = Some("打开页面".to_owned());
+        table.entries.get_mut("u000004").unwrap().translation = Some("粗体".to_owned());
+        assert_eq!(
+            apply(html, &table, false).unwrap(),
+            "<p>你好 {{name}}，<a title='访问 {site}' aria-label='打开页面'><strong title=\"粗体\">世界</strong></a>！</p>"
+        );
+    }
+
+    #[test]
+    fn textarea_translates_attributes_but_preserves_default_value() {
+        let html = "<textarea placeholder=Message aria-label='Your message' title='Help'>Hello &amp; <b>not markup</b> {{name}}</textarea>";
+        let mut table = extract(html).unwrap();
+        assert_eq!(table.entries.len(), 3);
+        assert!(
+            table
+                .entries
+                .values()
+                .all(|entry| entry.kind == EntryKind::Attribute)
+        );
+        for entry in table.entries.values_mut() {
+            entry.translation = Some(format!("译：{}", entry.source));
+        }
+        assert_eq!(
+            apply(html, &table, false).unwrap(),
+            "<textarea placeholder=\"译：Message\" aria-label='译：Your message' title='译：Help'>Hello &amp; <b>not markup</b> {{name}}</textarea>"
+        );
+        assert!(extract_version(html, 1).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn translate_yes_and_empty_reset_only_soft_inheritance() {
+        let html = "<div translate=no>Keep <span translate=yes title='Hint'>Translate</span> keep <span translate=''>Again</span><span translate=invalid>Keep</span><textarea translate=yes placeholder='Message'>Keep</textarea><code><span translate=yes>Keep</span></code><pre><span translate=yes>Keep</span></pre><div class=notranslate><span translate=yes>Keep</span></div></div><p>After</p>";
+        let mut table = extract(html).unwrap();
+        let sources = table
+            .entries
+            .values()
+            .map(|entry| entry.source.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            [
+                "[[[WT_000001]]]Translate[[[WT_000002]]]",
+                "Hint",
+                "[[[WT_000001]]]Again[[[WT_000002]]]",
+                "Message",
+                "After"
+            ]
+        );
+        fill_identity(&mut table);
+        assert_eq!(apply(html, &table, false).unwrap(), html);
+        let legacy = extract_version(html, 1).unwrap();
+        assert_eq!(legacy.entries.len(), 1);
+        assert_eq!(legacy.entries["u000001"].source, "After");
+    }
+
+    #[test]
+    fn legacy_version_keeps_original_grouping_and_applies() {
+        let html = "<p>Click <a title=Open>here</a> or <a title=Open>there</a>.</p>";
+        let mut legacy = extract_version(html, 1).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert_eq!(
+            legacy
+                .entries
+                .values()
+                .map(|entry| entry.source.as_str())
+                .collect::<Vec<_>>(),
+            ["Click", "Open", "here", "or", "Open", "there"]
+        );
+        fill_identity(&mut legacy);
+        assert_eq!(apply(html, &legacy, false).unwrap(), html);
+        legacy.entries.get_mut("u000002").unwrap().translation = Some("打开".to_owned());
+        legacy.entries.get_mut("u000005").unwrap().translation = Some("开启".to_owned());
+        assert_eq!(
+            apply(html, &legacy, false).unwrap(),
+            "<p>Click <a title=\"打开\">here</a> or <a title=\"开启\">there</a>.</p>"
+        );
+        legacy.version = 2;
+        assert!(apply(html, &legacy, false).is_err());
+        assert!(extract_version(html, 3).is_err());
+    }
+
+    #[test]
+    fn many_paragraphs_compose_only_their_own_attribute_edits() {
+        let html = "<p>Click <a title=Open>here</a>.</p>".repeat(2048);
+        let mut table = extract(&html).unwrap();
+        for entry in table.entries.values_mut() {
+            entry.translation = Some(match entry.kind {
+                EntryKind::Text => "点击[[[WT_000001]]]这里[[[WT_000002]]]。".to_owned(),
+                EntryKind::Attribute => format!("打开 {}", entry.start),
+            });
+        }
+        let result = apply(&html, &table, false).unwrap();
+        let expected = table
+            .entries
+            .values()
+            .filter(|entry| entry.kind == EntryKind::Attribute)
+            .map(|entry| format!("<p>点击<a title=\"打开 {}\">这里</a>。</p>", entry.start))
+            .collect::<String>();
+        assert_eq!(result, expected);
     }
 }
